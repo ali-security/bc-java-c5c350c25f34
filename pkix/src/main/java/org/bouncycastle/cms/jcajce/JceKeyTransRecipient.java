@@ -261,15 +261,8 @@ public abstract class JceKeyTransRecipient
 
                 if (validateKeySize)
                 {
-                    if (encryptedEncryptionKey.equals(CMSObjectIdentifiers.id_alg_cek_hkdf_sha256))
-                    {
-                        helper.keySizeCheck(
-                            AlgorithmIdentifier.getInstance(encryptedKeyAlgorithm.getParameters()), key);
-                    }
-                    else
-                    {
-                        helper.keySizeCheck(encryptedKeyAlgorithm, key);
-                    }
+                    // keySizeCheck resolves an id-alg-cek-hkdf-sha256 wrapper to the inner algorithm
+                    helper.keySizeCheck(encryptedKeyAlgorithm, key);
                 }
 
                 return key;

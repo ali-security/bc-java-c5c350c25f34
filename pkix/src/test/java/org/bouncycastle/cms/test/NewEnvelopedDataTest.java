@@ -3,12 +3,14 @@ package org.bouncycastle.cms.test;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.math.BigInteger;
 import java.security.AlgorithmParameters;
 import java.security.GeneralSecurityException;
 import java.security.Key;
 import java.security.KeyFactory;
 import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
 import java.security.PrivateKey;
@@ -25,7 +27,9 @@ import java.util.Collection;
 import java.util.Hashtable;
 import java.util.Iterator;
 
+import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
+import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.OAEPParameterSpec;
 import javax.crypto.spec.PSource;
 import javax.crypto.spec.SecretKeySpec;
@@ -35,6 +39,7 @@ import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
 import org.bouncycastle.asn1.ASN1EncodableVector;
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.ASN1InputStream;
 import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
@@ -45,6 +50,7 @@ import org.bouncycastle.asn1.DEROctetString;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.DERSet;
 import org.bouncycastle.asn1.DERUTF8String;
+import org.bouncycastle.asn1.bc.BCObjectIdentifiers;
 import org.bouncycastle.asn1.cms.Attribute;
 import org.bouncycastle.asn1.cms.AttributeTable;
 import org.bouncycastle.asn1.cms.CCMParameters;
@@ -95,6 +101,8 @@ import org.bouncycastle.cms.bc.BcRSAKeyTransRecipientInfoGenerator;
 import org.bouncycastle.cms.jcajce.JceCMSContentEncryptorBuilder;
 import org.bouncycastle.cms.jcajce.JceKEKEnvelopedRecipient;
 import org.bouncycastle.cms.jcajce.JceKEKRecipientInfoGenerator;
+import org.bouncycastle.cms.jcajce.JceKEMEnvelopedRecipient;
+import org.bouncycastle.cms.jcajce.JceKEMRecipientInfoGenerator;
 import org.bouncycastle.cms.jcajce.JceKeyAgreeEnvelopedRecipient;
 import org.bouncycastle.cms.jcajce.JceKeyAgreeRecipientId;
 import org.bouncycastle.cms.jcajce.JceKeyAgreeRecipientInfoGenerator;
@@ -103,13 +111,21 @@ import org.bouncycastle.cms.jcajce.JceKeyTransRecipientId;
 import org.bouncycastle.cms.jcajce.JceKeyTransRecipientInfoGenerator;
 import org.bouncycastle.cms.jcajce.JcePasswordEnvelopedRecipient;
 import org.bouncycastle.cms.jcajce.JcePasswordRecipientInfoGenerator;
+import org.bouncycastle.crypto.digests.SHA256Digest;
+import org.bouncycastle.crypto.generators.HKDFBytesGenerator;
+import org.bouncycastle.crypto.params.HKDFParameters;
+import org.bouncycastle.jcajce.io.CipherOutputStream;
 import org.bouncycastle.jcajce.spec.AEADParameterSpec;
 import org.bouncycastle.jce.ECGOST3410NamedCurveTable;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.openssl.PEMKeyPair;
 import org.bouncycastle.openssl.PEMParser;
+import org.bouncycastle.operator.GenericKey;
 import org.bouncycastle.operator.OutputEncryptor;
 import org.bouncycastle.operator.jcajce.JcaAlgorithmParametersConverter;
+import org.bouncycastle.operator.jcajce.JceGenericKey;
+import org.bouncycastle.pqc.jcajce.provider.BouncyCastlePQCProvider;
+import org.bouncycastle.pqc.jcajce.spec.KyberParameterSpec;
 import org.bouncycastle.util.Strings;
 import org.bouncycastle.util.encoders.Base64;
 import org.bouncycastle.util.encoders.Hex;
@@ -708,6 +724,81 @@ public class NewEnvelopedDataTest
         }
     }
 
+    public void testKEMWithHKDFKeySizeValidation()
+        throws Exception
+    {
+        Security.addProvider(new BouncyCastlePQCProvider());
+
+        KeyPairGenerator kybKpGen = KeyPairGenerator.getInstance("Kyber", "BCPQC");
+
+        kybKpGen.initialize(KyberParameterSpec.kyber512);
+
+        KeyPair kybKp = kybKpGen.generateKeyPair();
+        byte[] kybKeyId = new byte[]{1, 2, 3, 4, 5};
+
+        byte[] data = "WallaWallaWashington".getBytes();
+        byte[] wrongSizeKey = new byte[32];   // 256 bits of keying material, content encryption algorithm says aes128-CBC
+
+        for (int i = 0; i != wrongSizeKey.length; i++)
+        {
+            wrongSizeKey[i] = (byte)i;
+        }
+
+        CMSEnvelopedDataGenerator edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JceKEMRecipientInfoGenerator(kybKeyId, kybKp.getPublic(), CMSAlgorithm.AES256_WRAP)
+            .setKDF(new AlgorithmIdentifier(NISTObjectIdentifiers.id_shake256)));
+
+        CMSEnvelopedData ed = edGen.generate(
+            new CMSProcessableByteArray(data),
+            createHKDFContentEncryptor(CMSAlgorithm.AES128_CBC, wrongSizeKey));
+
+        assertEquals(ed.getEncryptionAlgOID(), CMSObjectIdentifiers.id_alg_cek_hkdf_sha256.getId());
+        assertEquals(AlgorithmIdentifier.getInstance(ed.getContentEncryptionAlgorithm().getParameters()).getAlgorithm(), CMSAlgorithm.AES128_CBC);
+
+        Collection c = ed.getRecipientInfos().getRecipients();
+
+        assertEquals(1, c.size());
+
+        RecipientInformation recipient = (RecipientInformation)c.iterator().next();
+
+        assertEquals(BCObjectIdentifiers.kyber512.getId(), recipient.getKeyEncryptionAlgOID());
+
+        // Note: we don't specify the provider here as we're actually using both BC and BCPQC
+        try
+        {
+            recipient.getContent(new JceKEMEnvelopedRecipient(kybKp.getPrivate()).setKeySizeValidation(true));
+            fail("CEK size not matching content encryption algorithm not picked up");
+        }
+        catch (CMSException e)
+        {
+            assertEquals("Expected key size for algorithm OID not found in recipient.", e.getMessage());
+        }
+
+        // without key size validation the mismatched message still decrypts
+        byte[] recData = recipient.getContent(new JceKEMEnvelopedRecipient(kybKp.getPrivate()).setKeySizeValidation(false));
+
+        assertEquals(true, Arrays.equals(data, recData));
+
+        // a CEK matching the content encryption algorithm passes validation
+        edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JceKEMRecipientInfoGenerator(kybKeyId, kybKp.getPublic(), CMSAlgorithm.AES256_WRAP)
+            .setKDF(new AlgorithmIdentifier(NISTObjectIdentifiers.id_shake256)));
+
+        ed = edGen.generate(
+            new CMSProcessableByteArray(data),
+            new JceCMSContentEncryptorBuilder(CMSAlgorithm.AES128_CBC)
+                .setEnableSha256HKdf(true)
+                .setProvider(BC).build());
+
+        recipient = (RecipientInformation)ed.getRecipientInfos().getRecipients().iterator().next();
+
+        recData = recipient.getContent(new JceKEMEnvelopedRecipient(kybKp.getPrivate()).setKeySizeValidation(true));
+
+        assertEquals(true, Arrays.equals(data, recData));
+    }
+
     // TODO: add KEMS to provider.
 //    public void testRsaKEMS()
 //        throws Exception
@@ -897,6 +988,69 @@ public class NewEnvelopedDataTest
         {
             assertEquals("AEAD tag size 96 bits below required minimum 128 bits", e.getMessage());
         }
+    }
+
+    public void testKeyTransWithHKDFKeySizeValidation()
+        throws Exception
+    {
+        byte[] data = "WallaWallaWashington".getBytes();
+        byte[] wrongSizeKey = new byte[32];   // 256 bits of keying material, content encryption algorithm says aes128-CBC
+
+        for (int i = 0; i != wrongSizeKey.length; i++)
+        {
+            wrongSizeKey[i] = (byte)i;
+        }
+
+        CMSEnvelopedDataGenerator edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JceKeyTransRecipientInfoGenerator(_reciCert).setProvider(BC));
+
+        CMSEnvelopedData ed = edGen.generate(
+            new CMSProcessableByteArray(data),
+            createHKDFContentEncryptor(CMSAlgorithm.AES128_CBC, wrongSizeKey));
+
+        assertEquals(ed.getEncryptionAlgOID(), CMSObjectIdentifiers.id_alg_cek_hkdf_sha256.getId());
+        assertEquals(AlgorithmIdentifier.getInstance(ed.getContentEncryptionAlgorithm().getParameters()).getAlgorithm(), CMSAlgorithm.AES128_CBC);
+
+        RecipientInformationStore recipients = ed.getRecipientInfos();
+
+        Collection c = recipients.getRecipients();
+
+        assertEquals(1, c.size());
+
+        RecipientInformation recipient = (RecipientInformation)c.iterator().next();
+
+        try
+        {
+            recipient.getContent(new JceKeyTransEnvelopedRecipient(_reciKP.getPrivate()).setKeySizeValidation(true).setProvider(BC));
+            fail("CEK size not matching content encryption algorithm not picked up");
+        }
+        catch (CMSException e)
+        {
+            assertEquals("Expected key size for algorithm OID not found in recipient.", e.getMessage());
+        }
+
+        // without key size validation the mismatched message still decrypts
+        byte[] recData = recipient.getContent(new JceKeyTransEnvelopedRecipient(_reciKP.getPrivate()).setKeySizeValidation(false).setProvider(BC));
+
+        assertEquals(true, Arrays.equals(data, recData));
+
+        // a CEK matching the content encryption algorithm passes validation
+        edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JceKeyTransRecipientInfoGenerator(_reciCert).setProvider(BC));
+
+        ed = edGen.generate(
+            new CMSProcessableByteArray(data),
+            new JceCMSContentEncryptorBuilder(CMSAlgorithm.AES128_CBC)
+                .setEnableSha256HKdf(true)
+                .setProvider(BC).build());
+
+        recipient = (RecipientInformation)ed.getRecipientInfos().getRecipients().iterator().next();
+
+        recData = recipient.getContent(new JceKeyTransEnvelopedRecipient(_reciKP.getPrivate()).setKeySizeValidation(true).setProvider(BC));
+
+        assertEquals(true, Arrays.equals(data, recData));
     }
 
     public void testKeyTransOAEPDefault()
@@ -1671,6 +1825,119 @@ public class NewEnvelopedDataTest
         throws Exception
     {
         tryKekAlgorithm(CMSTestUtil.makeCamelliaKey(256), NTTObjectIdentifiers.id_camellia256_wrap);
+    }
+
+    public void testKEKWithHKDFKeySizeValidation()
+        throws Exception
+    {
+        byte[] data = "WallaWallaWashington".getBytes();
+        byte[] wrongSizeKey = new byte[32];   // 256 bits of keying material, content encryption algorithm says aes128-CBC
+
+        for (int i = 0; i != wrongSizeKey.length; i++)
+        {
+            wrongSizeKey[i] = (byte)i;
+        }
+
+        SecretKey kek = CMSTestUtil.makeAESKey(128);
+        byte[] kekId = new byte[]{1, 2, 3, 4, 5};
+
+        CMSEnvelopedDataGenerator edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JceKEKRecipientInfoGenerator(kekId, kek).setProvider(BC));
+
+        CMSEnvelopedData ed = edGen.generate(
+            new CMSProcessableByteArray(data),
+            createHKDFContentEncryptor(CMSAlgorithm.AES128_CBC, wrongSizeKey));
+
+        assertEquals(ed.getEncryptionAlgOID(), CMSObjectIdentifiers.id_alg_cek_hkdf_sha256.getId());
+        assertEquals(AlgorithmIdentifier.getInstance(ed.getContentEncryptionAlgorithm().getParameters()).getAlgorithm(), CMSAlgorithm.AES128_CBC);
+
+        Collection c = ed.getRecipientInfos().getRecipients();
+
+        assertEquals(1, c.size());
+
+        RecipientInformation recipient = (RecipientInformation)c.iterator().next();
+
+        assertEquals(NISTObjectIdentifiers.id_aes128_wrap.getId(), recipient.getKeyEncryptionAlgOID());
+
+        try
+        {
+            recipient.getContent(new JceKEKEnvelopedRecipient(kek).setKeySizeValidation(true).setProvider(BC));
+            fail("CEK size not matching content encryption algorithm not picked up");
+        }
+        catch (CMSException e)
+        {
+            assertEquals("Expected key size for algorithm OID not found in recipient.", e.getMessage());
+        }
+
+        // without key size validation the mismatched message still decrypts
+        byte[] recData = recipient.getContent(new JceKEKEnvelopedRecipient(kek).setKeySizeValidation(false).setProvider(BC));
+
+        assertEquals(true, Arrays.equals(data, recData));
+
+        // a CEK matching the content encryption algorithm passes validation
+        edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JceKEKRecipientInfoGenerator(kekId, kek).setProvider(BC));
+
+        ed = edGen.generate(
+            new CMSProcessableByteArray(data),
+            new JceCMSContentEncryptorBuilder(CMSAlgorithm.AES128_CBC)
+                .setEnableSha256HKdf(true)
+                .setProvider(BC).build());
+
+        recipient = (RecipientInformation)ed.getRecipientInfos().getRecipients().iterator().next();
+
+        recData = recipient.getContent(new JceKEKEnvelopedRecipient(kek).setKeySizeValidation(true).setProvider(BC));
+
+        assertEquals(true, Arrays.equals(data, recData));
+    }
+
+    /**
+     * Content encryptor producing the same RFC 9709 id-alg-cek-hkdf-sha256 output as
+     * JceCMSContentEncryptorBuilder.setEnableSha256HKdf(true), but over a caller supplied
+     * content-encryption key, so the key size need not match the content encryption algorithm.
+     */
+    private static OutputEncryptor createHKDFContentEncryptor(ASN1ObjectIdentifier encryptionOID, byte[] cek)
+        throws Exception
+    {
+        byte[] iv = new byte[16];
+
+        new SecureRandom().nextBytes(iv);
+
+        AlgorithmIdentifier contentAlgId = new AlgorithmIdentifier(encryptionOID, new DEROctetString(iv));
+        final AlgorithmIdentifier kdfAlgId = new AlgorithmIdentifier(CMSObjectIdentifiers.id_alg_cek_hkdf_sha256, contentAlgId);
+        final SecretKey contentKey = new SecretKeySpec(cek, "AES");
+
+        HKDFBytesGenerator kdf = new HKDFBytesGenerator(new SHA256Digest());
+
+        kdf.init(new HKDFParameters(cek, Strings.toByteArray("The Cryptographic Message Syntax"), contentAlgId.getEncoded(ASN1Encoding.DER)));
+
+        byte[] derivedKey = new byte[cek.length];
+
+        kdf.generateBytes(derivedKey, 0, derivedKey.length);
+
+        final Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding", BC);
+
+        cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(derivedKey, "AES"), new IvParameterSpec(iv));
+
+        return new OutputEncryptor()
+        {
+            public AlgorithmIdentifier getAlgorithmIdentifier()
+            {
+                return kdfAlgId;
+            }
+
+            public OutputStream getOutputStream(OutputStream encOut)
+            {
+                return new CipherOutputStream(encOut, cipher);
+            }
+
+            public GenericKey getKey()
+            {
+                return new JceGenericKey(kdfAlgId, contentKey);
+            }
+        };
     }
 
     private void tryKekAlgorithm(SecretKey kek, ASN1ObjectIdentifier algOid)

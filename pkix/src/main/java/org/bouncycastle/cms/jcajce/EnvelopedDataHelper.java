@@ -260,6 +260,28 @@ public class EnvelopedDataHelper
     public void keySizeCheck(AlgorithmIdentifier keyAlgorithm, Key key)
         throws CMSException
     {
+        // RFC 9709: the key size to check is that of the content-encryption algorithm carried
+        // in the id-alg-cek-hkdf-sha256 parameters, not of the KDF wrapper (which has none).
+        // Unwrapped inline (rather than via CMSUtils) so this check does not depend on other patches.
+        if (CMSObjectIdentifiers.id_alg_cek_hkdf_sha256.equals(keyAlgorithm.getAlgorithm()))
+        {
+            ASN1Encodable params = keyAlgorithm.getParameters();
+
+            if (params == null)
+            {
+                throw new CMSException("RFC 9709 key derivation names no content-encryption algorithm");
+            }
+
+            try
+            {
+                keyAlgorithm = AlgorithmIdentifier.getInstance(params);
+            }
+            catch (IllegalArgumentException e)
+            {
+                throw new CMSException("unable to read RFC 9709 content-encryption algorithm: " + e.getMessage(), e);
+            }
+        }
+
         int expectedKeySize = EnvelopedDataHelper.KEY_SIZE_PROVIDER.getKeySize(keyAlgorithm);
         if (expectedKeySize > 0)
         {
