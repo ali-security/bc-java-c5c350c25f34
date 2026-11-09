@@ -19,11 +19,16 @@ import javax.crypto.spec.OAEPParameterSpec;
 import javax.crypto.spec.PSource;
 import javax.security.auth.x500.X500Principal;
 
+import junit.framework.AssertionFailedError;
 import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
 import org.bouncycastle.asn1.*;
+import org.bouncycastle.asn1.DERNull;
 import org.bouncycastle.asn1.cmp.CMPObjectIdentifiers;
+import org.bouncycastle.asn1.cmp.PBMParameter;
+import org.bouncycastle.asn1.iana.IANAObjectIdentifiers;
+import org.bouncycastle.asn1.oiw.OIWObjectIdentifiers;
 import org.bouncycastle.asn1.crmf.*;
 import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
 import org.bouncycastle.asn1.ntt.NTTObjectIdentifiers;
@@ -37,11 +42,13 @@ import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.X509v1CertificateBuilder;
 import org.bouncycastle.cert.crmf.CRMFException;
+import org.bouncycastle.cert.crmf.CertificateRequestMessage;
 import org.bouncycastle.cert.crmf.EncryptedValueBuilder;
 import org.bouncycastle.cert.crmf.EncryptedValuePadder;
 import org.bouncycastle.cert.crmf.EncryptedValueParser;
 import org.bouncycastle.cert.crmf.PKIArchiveControl;
 import org.bouncycastle.cert.crmf.PKMACBuilder;
+import org.bouncycastle.cert.crmf.PKMACValuesCalculator;
 import org.bouncycastle.cert.crmf.ValueDecryptorGenerator;
 import org.bouncycastle.cert.crmf.bc.BcCRMFEncryptorBuilder;
 import org.bouncycastle.cert.crmf.bc.BcEncryptedValueBuilder;
@@ -117,6 +124,75 @@ public class AllTests
     public void tearDown()
     {
 
+    }
+
+    public void testPKMACIterationCountCeiling()
+        throws Exception
+    {
+        AlgorithmIdentifier owf = new AlgorithmIdentifier(OIWObjectIdentifiers.idSHA1);
+        AlgorithmIdentifier mac = new AlgorithmIdentifier(IANAObjectIdentifiers.hmacSHA1, DERNull.INSTANCE);
+        byte[] salt = new byte[20];
+
+        // A PKMACBuilder with no explicit ceiling must still reject an attacker-declared iteration
+        // count (from an untrusted CMP PBMParameter) before the iterated hash runs.
+        PBMParameter hostile = new PBMParameter(salt, owf, Integer.MAX_VALUE, mac);
+        try
+        {
+            new PKMACBuilder(new JcePKMACValuesCalculator()).setParameters(hostile);
+            fail("no exception on oversized iteration count");
+        }
+        catch (IllegalArgumentException e)
+        {
+            assertTrue(e.getMessage().startsWith("iteration count exceeds limit"));
+        }
+
+        // A legitimate count is still accepted.
+        PBMParameter benign = new PBMParameter(salt, owf, 1000, mac);
+        new PKMACBuilder(new JcePKMACValuesCalculator()).setParameters(benign);
+    }
+
+    public void testPKMACProofOfPossessionIterationCountCeiling()
+        throws Exception
+    {
+        KeyPairGenerator kGen = KeyPairGenerator.getInstance("RSA", BC);
+
+        kGen.initialize(512);
+
+        KeyPair kp = kGen.generateKeyPair();
+
+        JcaCertificateRequestMessageBuilder certReqBuild = new JcaCertificateRequestMessageBuilder(BigInteger.ONE);
+
+        certReqBuild.setPublicKey(kp.getPublic())
+                    .setAuthInfoPKMAC(new PKMACBuilder(new JcePKMACValuesCalculator()), "fred".toCharArray())
+                    .setProofOfPossessionSigningKeySigner(new JcaContentSignerBuilder("SHA1withRSA").setProvider(BC).build(kp.getPrivate()));
+
+        CertReqMsg legit = certReqBuild.build().toASN1Structure();
+        POPOSigningKey popoSign = POPOSigningKey.getInstance(legit.getPop().getObject());
+
+        // Swap in a publicKeyMAC declaring an attacker-chosen iteration count. The PKMAC is checked
+        // before the POP signature, so the PBMParameter alone reaches the iterated hash.
+        PBMParameter hostile = new PBMParameter(new byte[20], new AlgorithmIdentifier(OIWObjectIdentifiers.idSHA1),
+            Integer.MAX_VALUE, new AlgorithmIdentifier(IANAObjectIdentifiers.hmacSHA1, DERNull.INSTANCE));
+        POPOSigningKeyInput hostileInput = new POPOSigningKeyInput(
+            new PKMACValue(hostile, new DERBitString(new byte[20])), popoSign.getPoposkInput().getPublicKey());
+        CertReqMsg forged = new CertReqMsg(legit.getCertReq(),
+            new ProofOfPossession(new POPOSigningKey(hostileInput, popoSign.getAlgorithmIdentifier(), popoSign.getSignature())), null);
+
+        CertificateRequestMessage certReqMsg = new CertificateRequestMessage(forged.getEncoded());
+        CountingPKMACValuesCalculator calculator = new CountingPKMACValuesCalculator(100000);
+
+        try
+        {
+            certReqMsg.isValidSigningKeyPOP(new JcaContentVerifierProviderBuilder().setProvider(BC).build(kp.getPublic()),
+                new PKMACBuilder(calculator), "fred".toCharArray());
+            fail("no exception on oversized PKMAC iteration count");
+        }
+        catch (IllegalArgumentException e)
+        {
+            assertTrue(e.getMessage(), e.getMessage().startsWith("iteration count exceeds limit"));
+        }
+
+        assertEquals("iterated hash must not run for an oversized iteration count", 0, calculator.digestCount);
     }
 
     public void testBasicMessage()
@@ -642,6 +718,47 @@ public class AllTests
         EncryptedValueParser  parser = new EncryptedValueParser(value, padder);
 
         assertTrue(Arrays.areEqual(PASSPHRASE.toCharArray(), parser.readPassphrase(decGen)));
+    }
+
+    /**
+     * Delegating PKMAC calculator that counts iterated-hash rounds and aborts once a bound is
+     * passed, so a missing iteration-count ceiling fails the test rather than hanging it.
+     */
+    private static class CountingPKMACValuesCalculator
+        implements PKMACValuesCalculator
+    {
+        private final PKMACValuesCalculator delegate = new JcePKMACValuesCalculator().setProvider(BC);
+        private final int bound;
+
+        int digestCount;
+
+        CountingPKMACValuesCalculator(int bound)
+        {
+            this.bound = bound;
+        }
+
+        public void setup(AlgorithmIdentifier digestAlg, AlgorithmIdentifier macAlg)
+            throws CRMFException
+        {
+            delegate.setup(digestAlg, macAlg);
+        }
+
+        public byte[] calculateDigest(byte[] data)
+            throws CRMFException
+        {
+            if (++digestCount > bound)
+            {
+                throw new AssertionFailedError("iterated hash ran past " + bound + " rounds: iteration count not bounded");
+            }
+
+            return delegate.calculateDigest(data);
+        }
+
+        public byte[] calculateMac(byte[] pwd, byte[] data)
+            throws CRMFException
+        {
+            return delegate.calculateMac(pwd, data);
+        }
     }
 
     private static X509Certificate makeV1Certificate(KeyPair subKP, String _subDN, KeyPair issKP, String _issDN)

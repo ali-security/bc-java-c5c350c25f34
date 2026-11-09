@@ -12,6 +12,7 @@ import java.security.Security;
 import java.security.cert.X509Certificate;
 import java.util.Date;
 
+import junit.framework.AssertionFailedError;
 import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
@@ -21,6 +22,7 @@ import org.bouncycastle.asn1.DERBitString;
 import org.bouncycastle.asn1.DERNull;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.cmp.CMPCertificate;
+import org.bouncycastle.asn1.cmp.CMPObjectIdentifiers;
 import org.bouncycastle.asn1.cmp.CertConfirmContent;
 import org.bouncycastle.asn1.cmp.CertOrEncCert;
 import org.bouncycastle.asn1.cmp.CertRepMessage;
@@ -28,6 +30,7 @@ import org.bouncycastle.asn1.cmp.CertResponse;
 import org.bouncycastle.asn1.cmp.CertifiedKeyPair;
 import org.bouncycastle.asn1.cmp.PKIBody;
 import org.bouncycastle.asn1.cmp.PKIHeaderBuilder;
+import org.bouncycastle.asn1.cmp.PBMParameter;
 import org.bouncycastle.asn1.cmp.PKIMessage;
 import org.bouncycastle.asn1.cmp.PKIStatus;
 import org.bouncycastle.asn1.cmp.PKIStatusInfo;
@@ -37,7 +40,9 @@ import org.bouncycastle.asn1.crmf.EncryptedKey;
 import org.bouncycastle.asn1.crmf.EncryptedValue;
 import org.bouncycastle.asn1.crmf.ProofOfPossession;
 import org.bouncycastle.asn1.crmf.SubsequentMessage;
+import org.bouncycastle.asn1.iana.IANAObjectIdentifiers;
 import org.bouncycastle.asn1.misc.MiscObjectIdentifiers;
+import org.bouncycastle.asn1.oiw.OIWObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
@@ -48,15 +53,18 @@ import org.bouncycastle.asn1.x9.X9ObjectIdentifiers;
 import org.bouncycastle.cert.CertException;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.X509v3CertificateBuilder;
+import org.bouncycastle.cert.cmp.CMPException;
 import org.bouncycastle.cert.cmp.CertificateConfirmationContent;
 import org.bouncycastle.cert.cmp.CertificateConfirmationContentBuilder;
 import org.bouncycastle.cert.cmp.CertificateStatus;
 import org.bouncycastle.cert.cmp.GeneralPKIMessage;
 import org.bouncycastle.cert.cmp.ProtectedPKIMessage;
 import org.bouncycastle.cert.cmp.ProtectedPKIMessageBuilder;
+import org.bouncycastle.cert.crmf.CRMFException;
 import org.bouncycastle.cert.crmf.CertificateRequestMessage;
 import org.bouncycastle.cert.crmf.CertificateRequestMessageBuilder;
 import org.bouncycastle.cert.crmf.PKMACBuilder;
+import org.bouncycastle.cert.crmf.PKMACValuesCalculator;
 import org.bouncycastle.cert.crmf.jcajce.JcaCertificateRequestMessageBuilder;
 import org.bouncycastle.cert.crmf.jcajce.JcaEncryptedValueBuilder;
 import org.bouncycastle.cert.crmf.jcajce.JceCRMFEncryptorBuilder;
@@ -177,6 +185,47 @@ public class AllTests
 
         assertEquals(sender, message.getHeader().getSender());
         assertEquals(recipient, message.getHeader().getRecipient());
+    }
+
+    public void testMacProtectedMessageIterationCountCeiling()
+        throws Exception
+    {
+        GeneralName sender = new GeneralName(new X500Name("CN=attacker"));
+        GeneralName recip = new GeneralName(new X500Name("CN=victim"));
+
+        // passwordBasedMac protection declaring an attacker-chosen iteration count: the
+        // PBMParameter is not itself authenticated, so no password is needed to send it.
+        PBMParameter hostile = new PBMParameter(new byte[20], new AlgorithmIdentifier(OIWObjectIdentifiers.idSHA1),
+            Integer.MAX_VALUE, new AlgorithmIdentifier(IANAObjectIdentifiers.hmacSHA1, DERNull.INSTANCE));
+
+        PKIHeaderBuilder hdr = new PKIHeaderBuilder(2, sender, recip);
+        hdr.setProtectionAlg(new AlgorithmIdentifier(CMPObjectIdentifiers.passwordBasedMac, hostile));
+
+        PKIMessage forged = new PKIMessage(hdr.build(), new PKIBody(PKIBody.TYPE_CONFIRM, DERNull.INSTANCE),
+            new DERBitString(new byte[20]));
+        ProtectedPKIMessage message = new ProtectedPKIMessage(new GeneralPKIMessage(forged.getEncoded()));
+
+        assertTrue("message should carry password based MAC protection", message.hasPasswordBasedMacProtection());
+
+        CountingPKMACValuesCalculator calculator = new CountingPKMACValuesCalculator(100000);
+
+        try
+        {
+            message.verify(new PKMACBuilder(calculator), "secret".toCharArray());
+            fail("no exception on oversized PKMAC iteration count");
+        }
+        catch (CMPException e)
+        {
+            Throwable cause = e.getCause();
+            while (cause != null && !(cause instanceof IllegalArgumentException))
+            {
+                cause = cause.getCause();
+            }
+            assertNotNull("IllegalArgumentException expected in cause chain: " + e, cause);
+            assertTrue(cause.getMessage(), cause.getMessage().startsWith("iteration count exceeds limit"));
+        }
+
+        assertEquals("iterated hash must not run for an oversized iteration count", 0, calculator.digestCount);
     }
 
     public void testPBMac1ProtectedMessage()
@@ -400,6 +449,47 @@ public class AllTests
         else
         {
             assertNull(message.getCertTemplate().getValidity().getNotAfter());
+        }
+    }
+
+    /**
+     * Delegating PKMAC calculator that counts iterated-hash rounds and aborts once a bound is
+     * passed, so a missing iteration-count ceiling fails the test rather than hanging it.
+     */
+    private static class CountingPKMACValuesCalculator
+        implements PKMACValuesCalculator
+    {
+        private final PKMACValuesCalculator delegate = new JcePKMACValuesCalculator().setProvider(BC);
+        private final int bound;
+
+        int digestCount;
+
+        CountingPKMACValuesCalculator(int bound)
+        {
+            this.bound = bound;
+        }
+
+        public void setup(AlgorithmIdentifier digestAlg, AlgorithmIdentifier macAlg)
+            throws CRMFException
+        {
+            delegate.setup(digestAlg, macAlg);
+        }
+
+        public byte[] calculateDigest(byte[] data)
+            throws CRMFException
+        {
+            if (++digestCount > bound)
+            {
+                throw new AssertionFailedError("iterated hash ran past " + bound + " rounds: iteration count not bounded");
+            }
+
+            return delegate.calculateDigest(data);
+        }
+
+        public byte[] calculateMac(byte[] pwd, byte[] data)
+            throws CRMFException
+        {
+            return delegate.calculateMac(pwd, data);
         }
     }
 

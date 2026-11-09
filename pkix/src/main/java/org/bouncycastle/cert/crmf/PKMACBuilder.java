@@ -15,11 +15,19 @@ import org.bouncycastle.operator.MacCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.PBEMacCalculatorProvider;
 import org.bouncycastle.operator.RuntimeOperatorException;
+import org.bouncycastle.util.Properties;
 import org.bouncycastle.util.Strings;
 
 public class PKMACBuilder
     implements PBEMacCalculatorProvider
 {
+    /**
+     * Upper bound on the RFC 4211 PKMAC / CMP password-based-MAC iteration count honoured when no
+     * explicit ceiling was supplied to the builder (default 10,000,000). The count travels in the
+     * (unauthenticated) PBMParameter of an incoming CMP message and drives an iterated hash.
+     */
+    private static final String PKMAC_MAX_ITERATION_COUNT = "org.bouncycastle.pkmac.max_iteration_count";
+
     private AlgorithmIdentifier owf;
     private int iterationCount;
     private AlgorithmIdentifier mac;
@@ -137,9 +145,15 @@ public class PKMACBuilder
 
     private void checkIterationCountCeiling(int iterationCount)
     {
-        if (maxIterations > 0 && iterationCount > maxIterations)
+        // When no explicit ceiling was configured, fall back to a generous default so that an
+        // attacker-supplied PBMParameter from an incoming CMP message (verified via the get(...)
+        // entry point) cannot drive the iterated hash in genCalculator into a CPU-exhaustion DoS.
+        int ceiling = maxIterations > 0
+            ? maxIterations
+            : Properties.asInteger(PKMAC_MAX_ITERATION_COUNT, 10000000);
+        if (iterationCount > ceiling)
         {
-            throw new IllegalArgumentException("iteration count exceeds limit (" + iterationCount + " > " + maxIterations + ")");
+            throw new IllegalArgumentException("iteration count exceeds limit (" + iterationCount + " > " + ceiling + ")");
         }
     }
 
