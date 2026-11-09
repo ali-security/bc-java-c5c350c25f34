@@ -58,6 +58,7 @@ public abstract class JceKeyAgreeRecipient
     protected EnvelopedDataHelper contentHelper = helper;
     private SecretKeySizeProvider keySizeProvider = new DefaultSecretKeySizeProvider();
     private AlgorithmIdentifier privKeyAlgID = null;
+    private int minimumTagSizeInBits = 0;
 
     public JceKeyAgreeRecipient(PrivateKey recipientKey)
     {
@@ -130,6 +131,21 @@ public abstract class JceKeyAgreeRecipient
     public JceKeyAgreeRecipient setPrivateKeyAlgorithmIdentifier(AlgorithmIdentifier privKeyAlgID)
     {
         this.privKeyAlgID = privKeyAlgID;
+
+        return this;
+    }
+
+    /**
+     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
+     * attempt to recover AuthEnvelopedData whose content algorithm carries a shorter tag is rejected,
+     * mitigating an attacker downgrading the tag to a weaker length.
+     *
+     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
+     * @return this recipient.
+     */
+    public JceKeyAgreeRecipient setMinimumTagSize(int tagSizeInBits)
+    {
+        this.minimumTagSizeInBits = tagSizeInBits;
 
         return this;
     }
@@ -222,6 +238,8 @@ public abstract class JceKeyAgreeRecipient
     protected Key extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier contentEncryptionAlgorithm, SubjectPublicKeyInfo senderKey, ASN1OctetString userKeyingMaterial, byte[] encryptedContentEncryptionKey)
         throws CMSException
     {
+        CMSUtils.checkTagSize(minimumTagSizeInBits, contentEncryptionAlgorithm);
+
         try
         {
             AlgorithmIdentifier wrapAlg =

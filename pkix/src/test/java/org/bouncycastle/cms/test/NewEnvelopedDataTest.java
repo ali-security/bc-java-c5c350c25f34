@@ -75,6 +75,7 @@ import org.bouncycastle.cms.CMSEnvelopedData;
 import org.bouncycastle.cms.CMSEnvelopedDataGenerator;
 import org.bouncycastle.cms.CMSException;
 import org.bouncycastle.cms.CMSProcessableByteArray;
+import org.bouncycastle.cms.CMSTagLengthException;
 import org.bouncycastle.cms.CMSTypedData;
 import org.bouncycastle.cms.CMSTypedStream;
 import org.bouncycastle.cms.KeyAgreeRecipientInformation;
@@ -102,6 +103,7 @@ import org.bouncycastle.cms.jcajce.JceKeyTransRecipientId;
 import org.bouncycastle.cms.jcajce.JceKeyTransRecipientInfoGenerator;
 import org.bouncycastle.cms.jcajce.JcePasswordEnvelopedRecipient;
 import org.bouncycastle.cms.jcajce.JcePasswordRecipientInfoGenerator;
+import org.bouncycastle.jcajce.spec.AEADParameterSpec;
 import org.bouncycastle.jce.ECGOST3410NamedCurveTable;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.openssl.PEMKeyPair;
@@ -847,6 +849,54 @@ public class NewEnvelopedDataTest
             fail("recipients not matched using general recipient ID.");
         }
         assertTrue(collection.iterator().next() instanceof RecipientInformation);
+    }
+
+    public void testKeyTransWithHKDFMinimumTagSize()
+        throws Exception
+    {
+        byte[] data = "WallaWallaWashington".getBytes();
+
+        // a 96-bit (12-octet) GCM tag - valid under RFC 5084, but below a 128-bit floor
+        AlgorithmParameters algParams = AlgorithmParameters.getInstance("GCM", BC);
+        algParams.init(new AEADParameterSpec(new byte[12], 96));
+
+        OutputEncryptor enc = new JceCMSContentEncryptorBuilder(NISTObjectIdentifiers.id_aes128_GCM)
+            .setEnableSha256HKdf(true)
+            .setProvider(BC).setAlgorithmParameters(algParams).build();
+
+        CMSEnvelopedDataGenerator edGen = new CMSEnvelopedDataGenerator();
+
+        edGen.addRecipientInfoGenerator(new JceKeyTransRecipientInfoGenerator(_reciCert).setProvider(BC));
+
+        CMSEnvelopedData ed = edGen.generate(new CMSProcessableByteArray(data), enc);
+
+        assertEquals(ed.getEncryptionAlgOID(), CMSObjectIdentifiers.id_alg_cek_hkdf_sha256.getId());
+
+        AlgorithmIdentifier contentAlgId = AlgorithmIdentifier.getInstance(ed.getContentEncryptionAlgorithm().getParameters());
+
+        assertEquals(NISTObjectIdentifiers.id_aes128_GCM, contentAlgId.getAlgorithm());
+        assertEquals(12, GCMParameters.getInstance(contentAlgId.getParameters()).getIcvLen());
+
+        RecipientInformation recipient = (RecipientInformation)ed.getRecipientInfos().getRecipients().iterator().next();
+
+        // a minimum at or below the actual tag size recovers as normal
+        byte[] recData = recipient.getContent(new JceKeyTransEnvelopedRecipient(_reciKP.getPrivate()).setProvider(BC)
+            .setMinimumTagSize(96));
+
+        assertEquals(true, Arrays.equals(data, recData));
+
+        // a minimum above the actual tag size is refused with CMSTagLengthException
+        try
+        {
+            recipient.getContent(new JceKeyTransEnvelopedRecipient(_reciKP.getPrivate()).setProvider(BC)
+                .setMinimumTagSize(128));
+
+            fail("content recovered under a tag shorter than the configured minimum");
+        }
+        catch (CMSTagLengthException e)
+        {
+            assertEquals("AEAD tag size 96 bits below required minimum 128 bits", e.getMessage());
+        }
     }
 
     public void testKeyTransOAEPDefault()

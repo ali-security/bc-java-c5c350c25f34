@@ -28,6 +28,7 @@ public abstract class BcPasswordRecipient
     private final char[] password;
 
     private int schemeID = PasswordRecipient.PKCS5_SCHEME2_UTF8;
+    private int minimumTagSizeInBits = 0;
 
     BcPasswordRecipient(
         char[] password)
@@ -42,9 +43,23 @@ public abstract class BcPasswordRecipient
         return this;
     }
 
+    /**
+     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
+     * attempt to recover content whose AEAD content algorithm carries a shorter tag is rejected,
+     * mitigating an attacker downgrading the tag to a weaker length.
+     *
+     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
+     */
+    protected final void setMinimumTagSizeInBits(int tagSizeInBits)
+    {
+        this.minimumTagSizeInBits = tagSizeInBits;
+    }
+
     protected KeyParameter extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier contentEncryptionAlgorithm, byte[] derivedKey, byte[] encryptedContentEncryptionKey)
         throws CMSException
     {
+        CMSUtils.checkTagSize(minimumTagSizeInBits, contentEncryptionAlgorithm);
+
         Wrapper keyEncryptionCipher = EnvelopedDataHelper.createRFC3211Wrapper(keyEncryptionAlgorithm.getAlgorithm());
 
         keyEncryptionCipher.init(false, new ParametersWithIV(new KeyParameter(derivedKey), ASN1OctetString.getInstance(keyEncryptionAlgorithm.getParameters()).getOctets()));

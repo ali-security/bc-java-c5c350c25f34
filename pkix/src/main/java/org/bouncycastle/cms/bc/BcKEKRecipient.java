@@ -12,15 +12,30 @@ public abstract class BcKEKRecipient
     implements KEKRecipient
 {
     private SymmetricKeyUnwrapper unwrapper;
+    private int minimumTagSizeInBits = 0;
 
     public BcKEKRecipient(BcSymmetricKeyUnwrapper unwrapper)
     {
         this.unwrapper = unwrapper;
     }
 
+    /**
+     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
+     * attempt to recover content whose AEAD content algorithm carries a shorter tag is rejected,
+     * mitigating an attacker downgrading the tag to a weaker length.
+     *
+     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
+     */
+    protected final void setMinimumTagSizeInBits(int tagSizeInBits)
+    {
+        this.minimumTagSizeInBits = tagSizeInBits;
+    }
+
     protected CipherParameters extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier contentEncryptionAlgorithm, byte[] encryptedContentEncryptionKey)
         throws CMSException
     {
+        CMSUtils.checkTagSize(minimumTagSizeInBits, contentEncryptionAlgorithm);
+
         try
         {
             return CMSUtils.getBcKey(unwrapper.generateUnwrappedKey(contentEncryptionAlgorithm, encryptedContentEncryptionKey));

@@ -32,6 +32,7 @@ public abstract class JceKTSKeyTransRecipient
     protected Map extraMappings = new HashMap();
     protected boolean validateKeySize = false;
     protected boolean unwrappedKeyMustBeEncodable;
+    private int minimumTagSizeInBits = 0;
 
     public JceKTSKeyTransRecipient(PrivateKey recipientKey, byte[] partyVInfo)
     {
@@ -131,9 +132,26 @@ public abstract class JceKTSKeyTransRecipient
         return this;
     }
 
+    /**
+     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
+     * attempt to recover AuthEnvelopedData whose content algorithm carries a shorter tag is rejected,
+     * mitigating an attacker downgrading the tag to a weaker length.
+     *
+     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
+     * @return this recipient.
+     */
+    public JceKTSKeyTransRecipient setMinimumTagSize(int tagSizeInBits)
+    {
+        this.minimumTagSizeInBits = tagSizeInBits;
+
+        return this;
+    }
+
     protected Key extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier encryptedKeyAlgorithm, byte[] encryptedEncryptionKey)
         throws CMSException
     {
+        CMSUtils.checkTagSize(minimumTagSizeInBits, encryptedKeyAlgorithm);
+
         JceKTSKeyUnwrapper unwrapper = helper.createAsymmetricUnwrapper(keyEncryptionAlgorithm, recipientKey, ANONYMOUS_SENDER, partyVInfo);
 
         try
