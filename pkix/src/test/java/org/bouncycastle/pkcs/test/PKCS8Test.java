@@ -380,6 +380,112 @@ public class PKCS8Test
         }
     }
 
+    public void testScryptParallelizationBoundRoundTrip()
+        throws Exception
+    {
+        // scrypt also allocates ~128 * r * p bytes for its B array, so the parallelization
+        // parameter p is held to the same memory budget as N. A genuine key with p exactly at
+        // the bound (128 * r * p = 1 MiB) still decrypts, one byte less of budget refuses it.
+        PKCS8EncryptedPrivateKeyInfo encInfo = new PKCS8EncryptedPrivateKeyInfoBuilder(scryptKey).build(
+            new JcePKCSPBEOutputEncryptorBuilder(new ScryptConfig.Builder(16, 8, 1024).withSaltLength(20).build(), NISTObjectIdentifiers.id_aes256_CBC)
+                .setProvider("BC")
+                .build("Rabbit".toCharArray()));
+
+        String old = System.getProperty(PBE_MAX_SCRYPT_MEMORY);
+        try
+        {
+            System.setProperty(PBE_MAX_SCRYPT_MEMORY, String.valueOf(1024 * 1024));
+
+            PrivateKeyInfo pkInfo = encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()));
+
+            assertTrue("scrypt key round trip failed", Arrays.areEqual(scryptKey, pkInfo.getEncoded()));
+
+            System.setProperty(PBE_MAX_SCRYPT_MEMORY, String.valueOf(1024 * 1024 - 1));
+
+            try
+            {
+                encInfo.decryptPrivateKeyInfo(
+                    new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()));
+                fail("excessive scrypt parallelization parameter accepted");
+            }
+            catch (PKCSException e)
+            {
+                assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("scrypt cost parameters require more than 1048575 bytes") >= 0);
+            }
+        }
+        finally
+        {
+            if (old == null)
+            {
+                System.clearProperty(PBE_MAX_SCRYPT_MEMORY);
+            }
+            else
+            {
+                System.setProperty(PBE_MAX_SCRYPT_MEMORY, old);
+            }
+        }
+    }
+
+    public void testScryptParallelizationEngineCeiling()
+        throws Exception
+    {
+        // attacker-crafted scrypt parameters: tiny N, but p at the engine's ceiling for r = 1
+        // (Integer.MAX_VALUE / 1024), which needs 128 * r * p = 256 MiB for the B array alone.
+        // With a 64 MiB budget this has to be refused before any allocation is attempted.
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPbes2Container(new KeyDerivationFunc(MiscObjectIdentifiers.id_scrypt,
+            new ScryptParams(new byte[20], 2, 1, Integer.MAX_VALUE / 1024, 32)));
+
+        String old = System.getProperty(PBE_MAX_SCRYPT_MEMORY);
+        System.setProperty(PBE_MAX_SCRYPT_MEMORY, String.valueOf(64 * 1024 * 1024));
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("excessive scrypt parallelization parameter accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("scrypt cost parameters require more than 67108864 bytes") >= 0);
+        }
+        finally
+        {
+            if (old == null)
+            {
+                System.clearProperty(PBE_MAX_SCRYPT_MEMORY);
+            }
+            else
+            {
+                System.setProperty(PBE_MAX_SCRYPT_MEMORY, old);
+            }
+        }
+    }
+
+    public void testScryptParallelizationInvalid()
+        throws Exception
+    {
+        // a non-positive p, or one that does not fit in an int (and so would be silently
+        // truncated by intValue()), must be rejected outright.
+        BigInteger[] hostile = { BigInteger.ZERO, BigInteger.valueOf(-1), BigInteger.ONE.shiftLeft(32).add(BigInteger.ONE) };
+
+        for (int i = 0; i != hostile.length; i++)
+        {
+            PKCS8EncryptedPrivateKeyInfo encInfo = createPbes2Container(new KeyDerivationFunc(MiscObjectIdentifiers.id_scrypt,
+                new ScryptParams(new byte[20], BigInteger.valueOf(2), BigInteger.ONE, hostile[i], BigInteger.valueOf(32))));
+
+            try
+            {
+                encInfo.decryptPrivateKeyInfo(
+                    new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+                fail("invalid scrypt parallelization parameter accepted: " + hostile[i]);
+            }
+            catch (PKCSException e)
+            {
+                assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("invalid scrypt parameters") >= 0);
+            }
+        }
+    }
+
     private static PKCS8EncryptedPrivateKeyInfo createPbes2Container(KeyDerivationFunc kdf)
         throws Exception
     {

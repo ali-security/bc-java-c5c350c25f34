@@ -1,6 +1,7 @@
 package org.bouncycastle.pkcs.jcajce;
 
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.security.Provider;
 import java.security.SecureRandom;
 
@@ -26,6 +27,7 @@ import org.bouncycastle.operator.MacAlgorithmIdentifierFinder;
 import org.bouncycastle.operator.MacCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.util.BigIntegers;
+import org.bouncycastle.util.Properties;
 
 /**
  * A builder for RFC 8018 PBE based MAC calculators.
@@ -186,7 +188,12 @@ public class JcePBMac1CalculatorBuilder
             {
                 salt = pbeParams.getSalt();
                 iterationCount = BigIntegers.intValueExact(pbeParams.getIterationCount());
-                keySize = BigIntegers.intValueExact(pbeParams.getKeyLength()) * 8;
+                int maxIT = Properties.asInteger(PBE_MAX_ITERATION_COUNT, 10000000);
+                if (iterationCount > maxIT)
+                {
+                    throw new OperatorCreationException("iteration count (" + iterationCount + ") greater than " + maxIT);
+                }
+                keySize = validateKeyLength(pbeParams.getKeyLength()) * 8;
             }
             
             SecretKeyFactory secFact = helper.createSecretKeyFactory("PBKDF2");
@@ -225,5 +232,39 @@ public class JcePBMac1CalculatorBuilder
         {
             throw new OperatorCreationException("unable to create MAC calculator: " + e.getMessage(), e);
         }
+    }
+
+    // The PBKDF2 parameters of a PBMAC1 MAC arrive before the MAC has been checked, so they are
+    // bounded before the (CPU intensive) derivation to cap a verification-time DoS.
+    // Upper bound on the PBKDF2 iteration count honoured on verification (default 10,000,000).
+    private static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+
+    // A PBMAC1 MAC key is 20-64 bytes; anything beyond this is rejected as abusive.
+    private static final BigInteger MAX_KEY_LENGTH = BigInteger.valueOf(1024);
+
+    /**
+     * Validate a PBKDF2 keyLength from a PBMAC1 parameter set. As with the iteration count, the value
+     * arrives before the MAC has been checked and sizes the derivation output, so it has to be
+     * bounded before deriving; it is also multiplied by 8 at the call site, which overflows to a
+     * negative bit count for a large enough value.
+     *
+     * @param keyLength the keyLength from the wire.
+     * @return the validated keyLength in bytes.
+     * @throws IllegalStateException if the keyLength is absent, not positive, or larger than the
+     *         maximum supported.
+     */
+    private static int validateKeyLength(BigInteger keyLength)
+    {
+        if (keyLength == null || keyLength.signum() <= 0)
+        {
+            throw new IllegalStateException("keyLength must be positive");
+        }
+
+        if (keyLength.compareTo(MAX_KEY_LENGTH) > 0)
+        {
+            throw new IllegalStateException("keyLength " + keyLength + " greater than " + MAX_KEY_LENGTH);
+        }
+
+        return BigIntegers.intValueExact(keyLength);
     }
 }
