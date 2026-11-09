@@ -4,11 +4,21 @@ import java.math.BigInteger;
 import java.security.Security;
 
 import junit.framework.TestCase;
+import org.bouncycastle.asn1.ASN1EncodableVector;
+import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.DERNull;
+import org.bouncycastle.asn1.DEROctetString;
+import org.bouncycastle.asn1.DERSequence;
+import org.bouncycastle.asn1.misc.MiscObjectIdentifiers;
+import org.bouncycastle.asn1.misc.ScryptParams;
 import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo;
+import org.bouncycastle.asn1.pkcs.EncryptionScheme;
+import org.bouncycastle.asn1.pkcs.KeyDerivationFunc;
+import org.bouncycastle.asn1.pkcs.PBEParameter;
 import org.bouncycastle.asn1.pkcs.PBES2Parameters;
 import org.bouncycastle.asn1.pkcs.PBKDF2Params;
+import org.bouncycastle.asn1.pkcs.PKCS12PBEParams;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.asn1.pkcs.RSAPrivateKey;
@@ -18,6 +28,7 @@ import org.bouncycastle.crypto.util.ScryptConfig;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.pkcs.PKCS8EncryptedPrivateKeyInfo;
 import org.bouncycastle.pkcs.PKCS8EncryptedPrivateKeyInfoBuilder;
+import org.bouncycastle.pkcs.PKCSException;
 import org.bouncycastle.pkcs.jcajce.JcePKCSPBEInputDecryptorProviderBuilder;
 import org.bouncycastle.pkcs.jcajce.JcePKCSPBEOutputEncryptorBuilder;
 import org.bouncycastle.util.Arrays;
@@ -26,6 +37,9 @@ import org.bouncycastle.util.encoders.Base64;
 public class PKCS8Test
     extends TestCase
 {
+    private static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+    private static final String PBE_MAX_SCRYPT_MEMORY = "org.bouncycastle.pbe.max_scrypt_memory";
+
     private static BigInteger modulus = new BigInteger(
         "b6ce33ccbf839457b0d32487b6c807bca584f85c627466b787fc09d0b1f73d97c9a381eca20e0ba851d317a8964327fa0010de76c" +
             "6c0facb83f13612752d166b49d9ba272c38c9a4ed71a94ea69f7bbdc63d7a5c5d3f3c039223e4ac1bb5d433c6bf01e68364a7ef4f" +
@@ -164,6 +178,223 @@ public class PKCS8Test
         RSAPrivateKey k = RSAPrivateKey.getInstance(pkInfo.parsePrivateKey());
 
         assertEquals(modulus, k.getModulus());
+    }
+
+    public void testPbkdf2IterationCountBound()
+        throws Exception
+    {
+        // The PBES2/PBKDF2 iteration count travels in the unauthenticated encrypted-key container,
+        // so it must be bounded before the key-derivation runs. Encrypt with the writer's default
+        // count, then decrypt with the bound lowered below it: decryption must be rejected before
+        // the derivation rather than honouring an attacker-chosen cost.
+        PKCS8EncryptedPrivateKeyInfo encInfo = new PKCS8EncryptedPrivateKeyInfoBuilder(pkInfo).build(
+            new JcePKCSPBEOutputEncryptorBuilder(NISTObjectIdentifiers.id_aes256_CBC)
+                .setPRF(new AlgorithmIdentifier(PKCSObjectIdentifiers.id_hmacWithSHA256, DERNull.INSTANCE))
+                .setProvider("BC")
+                .build("hello".toCharArray()));
+
+        String old = System.getProperty(PBE_MAX_ITERATION_COUNT);
+        System.setProperty(PBE_MAX_ITERATION_COUNT, "1");
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("excessive PBKDF2 iteration count accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("greater than 1") >= 0);
+        }
+        finally
+        {
+            if (old == null)
+            {
+                System.clearProperty(PBE_MAX_ITERATION_COUNT);
+            }
+            else
+            {
+                System.setProperty(PBE_MAX_ITERATION_COUNT, old);
+            }
+        }
+    }
+
+    public void testPbkdf2IterationCountDefaultBound()
+        throws Exception
+    {
+        // attacker-crafted container: PBKDF2 with one iteration more than the default bound, so
+        // the derivation must be refused up front rather than burning CPU for every decrypt attempt.
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPbes2Container(new KeyDerivationFunc(PKCSObjectIdentifiers.id_PBKDF2,
+            new PBKDF2Params(new byte[20], 10000001, new AlgorithmIdentifier(PKCSObjectIdentifiers.id_hmacWithSHA256, DERNull.INSTANCE))));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("PBKDF2 iteration count above default bound accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("iteration count (10000001) greater than 10000000") >= 0);
+        }
+    }
+
+    public void testPbkdf2IterationCountOutOfRange()
+        throws Exception
+    {
+        // an iteration count that does not fit in an int must not be silently truncated.
+        ASN1EncodableVector v = new ASN1EncodableVector();
+        v.add(new DEROctetString(new byte[20]));
+        v.add(new ASN1Integer(BigInteger.ONE.shiftLeft(31)));
+
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPbes2Container(new KeyDerivationFunc(PKCSObjectIdentifiers.id_PBKDF2,
+            PBKDF2Params.getInstance(new DERSequence(v))));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("out of range PBKDF2 iteration count accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("invalid iteration count") >= 0);
+        }
+    }
+
+    public void testPKCS12PbeIterationCountDefaultBound()
+        throws Exception
+    {
+        // attacker-crafted pbeWithSHAAnd3-KeyTripleDES-CBC container: the PKCS#12 KDF iteration count
+        // travels unauthenticated, so one above the default bound must be refused up front.
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPbeContainer(new AlgorithmIdentifier(PKCSObjectIdentifiers.pbeWithSHAAnd3_KeyTripleDES_CBC,
+            new PKCS12PBEParams(new byte[20], 10000001)));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("PKCS#12 PBE iteration count above default bound accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("iteration count (10000001) greater than 10000000") >= 0);
+        }
+    }
+
+    public void testPbes1IterationCountDefaultBound()
+        throws Exception
+    {
+        // attacker-crafted PKCS#5 v1.5 (PBES1) pbeWithSHA1AndDES-CBC container: the PBKDF1 iteration
+        // count travels unauthenticated, so one above the default bound must be refused up front.
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPbeContainer(new AlgorithmIdentifier(PKCSObjectIdentifiers.pbeWithSHA1AndDES_CBC,
+            new PBEParameter(new byte[8], 10000001)));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("PBES1 iteration count above default bound accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("iteration count (10000001) greater than 10000000") >= 0);
+        }
+    }
+
+    public void testScryptBlockSizeBound()
+        throws Exception
+    {
+        // attacker-crafted scrypt parameters with an oversized block size r.
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPbes2Container(new KeyDerivationFunc(MiscObjectIdentifiers.id_scrypt,
+            new ScryptParams(new byte[20], 2, 2048, 1, 32)));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("excessive scrypt block size accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("scrypt block size (2048) greater than 1024") >= 0);
+        }
+    }
+
+    public void testScryptMemoryDefaultBound()
+        throws Exception
+    {
+        // attacker-crafted scrypt parameters needing 128 * N * r = 2 GiB of working memory,
+        // which must be refused before any allocation is attempted.
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPbes2Container(new KeyDerivationFunc(MiscObjectIdentifiers.id_scrypt,
+            new ScryptParams(new byte[20], 1 << 21, 8, 1, 32)));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("excessive scrypt memory cost accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("scrypt cost parameters require more than 1073741824 bytes") >= 0);
+        }
+    }
+
+    public void testScryptMemoryBound()
+        throws Exception
+    {
+        // a genuine scrypt protected key (128 * N * r = 1 MiB) decrypts under the default bound,
+        // but is refused once the bound is lowered below its working memory.
+        PKCS8EncryptedPrivateKeyInfo encInfo = new PKCS8EncryptedPrivateKeyInfoBuilder(scryptKey).build(
+            new JcePKCSPBEOutputEncryptorBuilder(new ScryptConfig.Builder(1024, 8, 1).withSaltLength(20).build(), NISTObjectIdentifiers.id_aes256_CBC)
+                .setProvider("BC")
+                .build("Rabbit".toCharArray()));
+
+        PrivateKeyInfo pkInfo = encInfo.decryptPrivateKeyInfo(
+            new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()));
+
+        assertTrue("scrypt key round trip failed", Arrays.areEqual(scryptKey, pkInfo.getEncoded()));
+
+        String old = System.getProperty(PBE_MAX_SCRYPT_MEMORY);
+        System.setProperty(PBE_MAX_SCRYPT_MEMORY, String.valueOf(1024 * 1024 - 1));
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(
+                new JcePKCSPBEInputDecryptorProviderBuilder().setProvider("BC").build("Rabbit".toCharArray()));
+            fail("excessive scrypt memory cost accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("scrypt cost parameters require more than 1048575 bytes") >= 0);
+        }
+        finally
+        {
+            if (old == null)
+            {
+                System.clearProperty(PBE_MAX_SCRYPT_MEMORY);
+            }
+            else
+            {
+                System.setProperty(PBE_MAX_SCRYPT_MEMORY, old);
+            }
+        }
+    }
+
+    private static PKCS8EncryptedPrivateKeyInfo createPbes2Container(KeyDerivationFunc kdf)
+        throws Exception
+    {
+        AlgorithmIdentifier algId = new AlgorithmIdentifier(PKCSObjectIdentifiers.id_PBES2,
+            new PBES2Parameters(kdf, new EncryptionScheme(NISTObjectIdentifiers.id_aes256_CBC, new DEROctetString(new byte[16]))));
+
+        // round trip through the encoding, as an attacker supplied blob would arrive.
+        return new PKCS8EncryptedPrivateKeyInfo(new EncryptedPrivateKeyInfo(algId, new byte[32]).getEncoded());
+    }
+
+    private static PKCS8EncryptedPrivateKeyInfo createPbeContainer(AlgorithmIdentifier algId)
+        throws Exception
+    {
+        // round trip through the encoding, as an attacker supplied blob would arrive.
+        return new PKCS8EncryptedPrivateKeyInfo(new EncryptedPrivateKeyInfo(algId, new byte[32]).getEncoded());
     }
 
     public void testSHA3_256Encryption()

@@ -1,6 +1,7 @@
 package org.bouncycastle.pkcs.jcajce;
 
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.security.Provider;
 
 import javax.crypto.Mac;
@@ -22,10 +23,15 @@ import org.bouncycastle.operator.MacCalculator;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.pkcs.PKCS12MacCalculatorBuilder;
 import org.bouncycastle.pkcs.PKCS12MacCalculatorBuilderProvider;
+import org.bouncycastle.util.Properties;
 
 public class JcePKCS12MacCalculatorBuilderProvider
     implements PKCS12MacCalculatorBuilderProvider
 {
+    // Upper bound on the PKCS#12 iteration count honoured on MAC verification (default 5,000,000).
+    private static final String PKCS12_MAX_IT_COUNT = "org.bouncycastle.pkcs12.max_it_count";
+    private static final BigInteger DEFAULT_MAX_IT_COUNT = BigInteger.valueOf(5000000);
+
     private JcaJceHelper helper = new DefaultJcaJceHelper();
 
     public JcePKCS12MacCalculatorBuilderProvider()
@@ -61,7 +67,7 @@ public class JcePKCS12MacCalculatorBuilderProvider
 
                     final Mac mac = helper.createMac(algorithm.getId());
 
-                    PBEParameterSpec defParams = new PBEParameterSpec(pbeParams.getIV(), pbeParams.getIterations().intValue());
+                    PBEParameterSpec defParams = new PBEParameterSpec(pbeParams.getIV(), validateIterationCount(pbeParams.getIterations()));
 
                     final SecretKey key = new PKCS12Key(password);
 
@@ -101,5 +107,32 @@ public class JcePKCS12MacCalculatorBuilderProvider
                 return new AlgorithmIdentifier(algorithmIdentifier.getAlgorithm(), DERNull.INSTANCE);
             }
         };
+    }
+
+    // The MAC key is derived from the wire-supplied iteration count before the MAC can be checked,
+    // so the count is bounded (as the PKCS#12 keystore does) to cap a pre-authentication CPU DoS.
+    private static int validateIterationCount(BigInteger ic)
+    {
+        if (ic.signum() < 0)
+        {
+            throw new IllegalStateException("negative iteration count found");
+        }
+        if (ic.bitLength() > 31)
+        {
+            throw new IllegalStateException("iteration counts >= 2^31 are not suppported");
+        }
+
+        BigInteger max = Properties.asBigInteger(PKCS12_MAX_IT_COUNT);
+        if (max == null)
+        {
+            max = DEFAULT_MAX_IT_COUNT;
+        }
+
+        if (ic.compareTo(max) > 0)
+        {
+            throw new IllegalStateException("iteration count " + ic + " greater than " + max);
+        }
+
+        return ic.intValue();
     }
 }

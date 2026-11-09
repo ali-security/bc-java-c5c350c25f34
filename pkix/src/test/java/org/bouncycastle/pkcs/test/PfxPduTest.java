@@ -26,20 +26,27 @@ import javax.crypto.spec.PBEKeySpec;
 
 import junit.framework.TestCase;
 import org.bouncycastle.asn1.ASN1Encodable;
+import org.bouncycastle.asn1.ASN1EncodableVector;
 import org.bouncycastle.asn1.ASN1Encoding;
+import org.bouncycastle.asn1.ASN1Integer;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.DERBMPString;
+import org.bouncycastle.asn1.DEROctetString;
 import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.cryptopro.CryptoProObjectIdentifiers;
 import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
 import org.bouncycastle.asn1.oiw.OIWObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.Attribute;
 import org.bouncycastle.asn1.pkcs.ContentInfo;
+import org.bouncycastle.asn1.pkcs.MacData;
+import org.bouncycastle.asn1.pkcs.PKCS12PBEParams;
 import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
+import org.bouncycastle.asn1.pkcs.Pfx;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
 import org.bouncycastle.asn1.x500.style.BCStyle;
+import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.SubjectKeyIdentifier;
@@ -59,6 +66,7 @@ import org.bouncycastle.operator.InputDecryptorProvider;
 import org.bouncycastle.operator.OutputEncryptor;
 import org.bouncycastle.operator.bc.BcDefaultDigestProvider;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.bouncycastle.pkcs.PKCS12MacCalculatorBuilderProvider;
 import org.bouncycastle.pkcs.PKCS12PfxPdu;
 import org.bouncycastle.pkcs.PKCS12PfxPduBuilder;
 import org.bouncycastle.pkcs.PKCS12SafeBag;
@@ -85,6 +93,7 @@ public class PfxPduTest
 {
     private static final String BC = BouncyCastleProvider.PROVIDER_NAME;
     private static final char[] passwd = {'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd'};
+    private static final String PKCS12_MAX_IT_COUNT = "org.bouncycastle.pkcs12.max_it_count";
 
     //
     // personal keys
@@ -775,6 +784,141 @@ public class PfxPduTest
         assertTrue(pfx.hasMac());
         assertTrue(pfx.isMacValid(new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), passwd));
         assertFalse(pfx.isMacValid(new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), "not right".toCharArray()));
+    }
+
+    public void testMacIterationCountDefaultBound()
+        throws Exception
+    {
+        // The MAC key is derived from the MacData iteration count before the MAC can be checked, so an
+        // attacker-supplied PFX declaring a count above the default bound must be refused up front.
+        PKCS12PfxPdu pfx = withMacIterationCount(createKeyBagPfx(), 5000001);
+
+        checkMacRejected(pfx, new JcePKCS12MacCalculatorBuilderProvider().setProvider("BC"), "iteration count 5000001 greater than 5000000");
+        checkMacRejected(pfx, new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), "iteration count 5000001 greater than 5000000");
+    }
+
+    public void testMacIterationCountBound()
+        throws Exception
+    {
+        // a genuine PFX (iteration count 1024) verifies under the default bound, but is refused
+        // once the bound is lowered below its iteration count.
+        PKCS12PfxPdu pfx = createKeyBagPfx();
+
+        assertTrue(pfx.isMacValid(new JcePKCS12MacCalculatorBuilderProvider().setProvider("BC"), passwd));
+        assertTrue(pfx.isMacValid(new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), passwd));
+
+        String old = System.getProperty(PKCS12_MAX_IT_COUNT);
+        System.setProperty(PKCS12_MAX_IT_COUNT, "1023");
+        try
+        {
+            checkMacRejected(pfx, new JcePKCS12MacCalculatorBuilderProvider().setProvider("BC"), "iteration count 1024 greater than 1023");
+            checkMacRejected(pfx, new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), "iteration count 1024 greater than 1023");
+        }
+        finally
+        {
+            if (old == null)
+            {
+                System.clearProperty(PKCS12_MAX_IT_COUNT);
+            }
+            else
+            {
+                System.setProperty(PKCS12_MAX_IT_COUNT, old);
+            }
+        }
+    }
+
+    public void testDodgyInputs()
+        throws Exception
+    {
+        // The MacData carries a negative iteration count. It is now rejected cleanly rather than
+        // driving a zero-round KDF that silently produces a weak MAC key.
+        PKCS12PfxPdu pfx = withMacIterationCount(createKeyBagPfx(), -1);
+
+        checkMacRejected(pfx, new JcePKCS12MacCalculatorBuilderProvider().setProvider("BC"), "negative iteration count found");
+        checkMacRejected(pfx, new BcPKCS12MacCalculatorBuilderProvider(BcDefaultDigestProvider.INSTANCE), "negative iteration count found");
+    }
+
+    public void testBcPKCS12PbeIterationCountBound()
+        throws Exception
+    {
+        // an attacker-supplied pbeWithSHAAnd3-KeyTripleDES-CBC protected key declaring an iteration
+        // count above the default bound must be refused before the key derivation runs.
+        PKCS8EncryptedPrivateKeyInfo encInfo = createPKCS12PbeContainer(new PKCS12PBEParams(new byte[20], 5000001));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(new BcPKCS12PBEInputDecryptorProviderBuilder().build(passwd));
+            fail("PKCS#12 PBE iteration count above default bound accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().endsWith("iteration count 5000001 greater than 5000000"));
+        }
+
+        // a count of 2^31 or more must be refused rather than truncated to a weak, zero-round derivation.
+        ASN1EncodableVector v = new ASN1EncodableVector();
+        v.add(new DEROctetString(new byte[20]));
+        v.add(new ASN1Integer(BigInteger.ONE.shiftLeft(31)));
+
+        encInfo = createPKCS12PbeContainer(PKCS12PBEParams.getInstance(new DERSequence(v)));
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(new BcPKCS12PBEInputDecryptorProviderBuilder().build(passwd));
+            fail("out of range PKCS#12 PBE iteration count accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().endsWith("iteration counts >= 2^31 are not suppported"));
+        }
+    }
+
+    private PKCS12PfxPdu createKeyBagPfx()
+        throws Exception
+    {
+        OutputEncryptor encOut = new BcPKCS12PBEOutputEncryptorBuilder(PKCSObjectIdentifiers.pbeWithSHAAnd3_KeyTripleDES_CBC, new CBCBlockCipher(new DESedeEngine())).build(passwd);
+        KeyFactory fact = KeyFactory.getInstance("RSA", BC);
+        PrivateKey privKey = fact.generatePrivate(privKeySpec);
+
+        PKCS12PfxPduBuilder builder = new PKCS12PfxPduBuilder();
+
+        builder.addEncryptedData(encOut, new JcaPKCS12SafeBagBuilder(privKey).build());
+
+        return builder.build(new BcPKCS12MacCalculatorBuilder(), passwd);
+    }
+
+    private static PKCS12PfxPdu withMacIterationCount(PKCS12PfxPdu pfx, int iterationCount)
+        throws Exception
+    {
+        Pfx pfxStruct = pfx.toASN1Structure();
+        MacData macData = pfxStruct.getMacData();
+
+        Pfx dodgy = new Pfx(pfxStruct.getAuthSafe(), new MacData(macData.getMac(), macData.getSalt(), iterationCount));
+
+        // round trip through the encoding, as an attacker supplied blob would arrive.
+        return new PKCS12PfxPdu(dodgy.getEncoded());
+    }
+
+    private static void checkMacRejected(PKCS12PfxPdu pfx, PKCS12MacCalculatorBuilderProvider macProvider, String message)
+    {
+        try
+        {
+            pfx.isMacValid(macProvider, passwd);
+            fail("dodgy MAC iteration count not rejected");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().endsWith(message));
+        }
+    }
+
+    private static PKCS8EncryptedPrivateKeyInfo createPKCS12PbeContainer(PKCS12PBEParams pbeParams)
+        throws Exception
+    {
+        AlgorithmIdentifier algId = new AlgorithmIdentifier(PKCSObjectIdentifiers.pbeWithSHAAnd3_KeyTripleDES_CBC, pbeParams);
+
+        // round trip through the encoding, as an attacker supplied blob would arrive.
+        return new PKCS8EncryptedPrivateKeyInfo(new org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo(algId, new byte[32]).getEncoded());
     }
 
     public void testBcEncryptedPrivateKeyInfo()

@@ -2,6 +2,7 @@ package org.bouncycastle.openssl.jcajce;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.math.BigInteger;
 import java.security.AlgorithmParameters;
 import java.security.GeneralSecurityException;
 import java.security.Provider;
@@ -28,6 +29,7 @@ import org.bouncycastle.openssl.PEMException;
 import org.bouncycastle.operator.InputDecryptor;
 import org.bouncycastle.operator.InputDecryptorProvider;
 import org.bouncycastle.operator.OperatorCreationException;
+import org.bouncycastle.util.Properties;
 import org.bouncycastle.util.Strings;
 
 /**
@@ -75,7 +77,8 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
                         EncryptionScheme scheme = params.getEncryptionScheme();
                         PBKDF2Params defParams = (PBKDF2Params)func.getParameters();
 
-                        int iterationCount = defParams.getIterationCount().intValue();
+                        // Bound the unauthenticated iteration count before deriving the key.
+                        int iterationCount = checkIterationCount(defParams.getIterationCount());
                         byte[] salt = defParams.getSalt();
 
                         String oid = scheme.getAlgorithm().getId();
@@ -104,7 +107,7 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
 
                         cipher = helper.createCipher(PEMUtilities.getCipherName(algorithm.getAlgorithm()));
 
-                        cipher.init(Cipher.DECRYPT_MODE, new PKCS12KeyWithParameters(password, params.getIV(), params.getIterations().intValue()));
+                        cipher.init(Cipher.DECRYPT_MODE, new PKCS12KeyWithParameters(password, params.getIV(), checkIterationCount(params.getIterations())));
                     }
                     else if (PEMUtilities.isPKCS5Scheme1(algorithm.getAlgorithm()))
                     {
@@ -123,7 +126,7 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
                             {
                                 return Strings.toByteArray(password);     // just drop hi-order byte.
                             }
-                        }, params.getSalt(), params.getIterationCount().intValue()));
+                        }, params.getSalt(), checkIterationCount(params.getIterationCount())));
                     }
                     else
                     {
@@ -153,5 +156,27 @@ public class JceOpenSSLPKCS8DecryptorProviderBuilder
                 }
             };
         };
+    }
+
+    // The KDF cost parameters of a PBES2-protected key arrive in an unauthenticated container, so
+    // they are bounded before the (CPU intensive) derivation to cap a decryption-time DoS.
+    // Upper bound on the PBKDF2 iteration count honoured on decryption (default 10,000,000).
+    private static final String PBE_MAX_ITERATION_COUNT = "org.bouncycastle.pbe.max_iteration_count";
+
+    private static int checkIterationCount(BigInteger ic)
+        throws IOException
+    {
+        if (ic == null || ic.signum() < 0 || ic.bitLength() > 31)
+        {
+            throw new IOException("invalid iteration count");
+        }
+
+        long max = Properties.asInteger(PBE_MAX_ITERATION_COUNT, 10000000);
+        if (ic.longValue() > max)
+        {
+            throw new IOException("iteration count (" + ic + ") greater than " + max);
+        }
+
+        return ic.intValue();
     }
 }

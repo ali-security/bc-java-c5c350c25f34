@@ -16,6 +16,17 @@ import junit.framework.Test;
 import junit.framework.TestCase;
 import junit.framework.TestSuite;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
+import org.bouncycastle.asn1.DERNull;
+import org.bouncycastle.asn1.DEROctetString;
+import org.bouncycastle.asn1.nist.NISTObjectIdentifiers;
+import org.bouncycastle.asn1.pkcs.EncryptedPrivateKeyInfo;
+import org.bouncycastle.asn1.pkcs.EncryptionScheme;
+import org.bouncycastle.asn1.pkcs.KeyDerivationFunc;
+import org.bouncycastle.asn1.pkcs.PBEParameter;
+import org.bouncycastle.asn1.pkcs.PBES2Parameters;
+import org.bouncycastle.asn1.pkcs.PBKDF2Params;
+import org.bouncycastle.asn1.pkcs.PKCS12PBEParams;
+import org.bouncycastle.asn1.pkcs.PKCSObjectIdentifiers;
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
@@ -178,6 +189,118 @@ public class
         rdKey = new JcaPEMKeyConverter().setProvider("BC").getPrivateKey(encInfo.decryptPrivateKeyInfo(new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray())));
 
         TestCase.assertEquals(key, rdKey);
+    }
+
+    public void testPbkdf2IterationCountBound()
+        throws Exception
+    {
+        if (Security.getProvider("BC") == null)
+        {
+            Security.addProvider(new BouncyCastleProvider());
+        }
+
+        // attacker-crafted container: the PBKDF2 iteration count travels unauthenticated, so one
+        // above the default bound must be refused before the key derivation runs.
+        AlgorithmIdentifier algId = new AlgorithmIdentifier(PKCSObjectIdentifiers.id_PBES2,
+            new PBES2Parameters(
+                new KeyDerivationFunc(PKCSObjectIdentifiers.id_PBKDF2,
+                    new PBKDF2Params(new byte[20], 10000001, new AlgorithmIdentifier(PKCSObjectIdentifiers.id_hmacWithSHA256, DERNull.INSTANCE))),
+                new EncryptionScheme(NISTObjectIdentifiers.id_aes256_CBC, new DEROctetString(new byte[16]))));
+
+        PKCS8EncryptedPrivateKeyInfo encInfo = new PKCS8EncryptedPrivateKeyInfo(
+            new EncryptedPrivateKeyInfo(algId, new byte[32]).getEncoded());
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("PBKDF2 iteration count above default bound accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("iteration count (10000001) greater than 10000000") >= 0);
+        }
+
+        // a genuine PEM encrypted key is refused once the bound is lowered below its iteration count.
+        KeyPairGenerator kpGen = KeyPairGenerator.getInstance("RSA", "BC");
+
+        kpGen.initialize(1024);
+
+        JceOpenSSLPKCS8EncryptorBuilder encryptorBuilder = new JceOpenSSLPKCS8EncryptorBuilder(PKCS8Generator.AES_256_CBC);
+
+        encryptorBuilder.setProvider("BC");
+        encryptorBuilder.setPassword("hello".toCharArray());
+
+        PKCS8EncryptedPrivateKeyInfo pemInfo = new PKCS8EncryptedPrivateKeyInfo(
+            new JcaPKCS8Generator(kpGen.generateKeyPair().getPrivate(), encryptorBuilder.build()).generate().getContent());
+
+        String propName = "org.bouncycastle.pbe.max_iteration_count";
+        String old = System.getProperty(propName);
+        System.setProperty(propName, "1");
+        try
+        {
+            pemInfo.decryptPrivateKeyInfo(new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("excessive PBKDF2 iteration count accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("greater than 1") >= 0);
+        }
+        finally
+        {
+            if (old == null)
+            {
+                System.clearProperty(propName);
+            }
+            else
+            {
+                System.setProperty(propName, old);
+            }
+        }
+    }
+
+    public void testPKCS12PbeIterationCountBound()
+        throws Exception
+    {
+        if (Security.getProvider("BC") == null)
+        {
+            Security.addProvider(new BouncyCastleProvider());
+        }
+
+        // attacker-crafted pbeWithSHAAnd3-KeyTripleDES-CBC container: the PKCS#12 KDF iteration count
+        // travels unauthenticated, so one above the default bound must be refused before the derivation.
+        checkPbeIterationCountRejected(new AlgorithmIdentifier(PKCSObjectIdentifiers.pbeWithSHAAnd3_KeyTripleDES_CBC,
+            new PKCS12PBEParams(new byte[20], 10000001)));
+    }
+
+    public void testPbes1IterationCountBound()
+        throws Exception
+    {
+        if (Security.getProvider("BC") == null)
+        {
+            Security.addProvider(new BouncyCastleProvider());
+        }
+
+        // attacker-crafted PKCS#5 v1.5 (PBES1) pbeWithSHA1AndDES-CBC container: the PBKDF1 iteration
+        // count travels unauthenticated, so one above the default bound must be refused before the derivation.
+        checkPbeIterationCountRejected(new AlgorithmIdentifier(PKCSObjectIdentifiers.pbeWithSHA1AndDES_CBC,
+            new PBEParameter(new byte[8], 10000001)));
+    }
+
+    private static void checkPbeIterationCountRejected(AlgorithmIdentifier algId)
+        throws Exception
+    {
+        PKCS8EncryptedPrivateKeyInfo encInfo = new PKCS8EncryptedPrivateKeyInfo(
+            new EncryptedPrivateKeyInfo(algId, new byte[32]).getEncoded());
+
+        try
+        {
+            encInfo.decryptPrivateKeyInfo(new JceOpenSSLPKCS8DecryptorProviderBuilder().setProvider("BC").build("hello".toCharArray()));
+            fail("iteration count above default bound accepted");
+        }
+        catch (PKCSException e)
+        {
+            assertTrue("unexpected message: " + e.getMessage(), e.getMessage().indexOf("iteration count (10000001) greater than 10000000") >= 0);
+        }
     }
 
     public void testPKCS8PlainNew()

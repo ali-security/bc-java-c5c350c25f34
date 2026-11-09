@@ -1,6 +1,7 @@
 package org.bouncycastle.pkcs.bc;
 
 import java.io.OutputStream;
+import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -27,9 +28,14 @@ import org.bouncycastle.crypto.params.ParametersWithIV;
 import org.bouncycastle.operator.GenericKey;
 import org.bouncycastle.operator.MacCalculator;
 import org.bouncycastle.util.Integers;
+import org.bouncycastle.util.Properties;
 
 class PKCS12PBEUtils
 {
+    // Upper bound on the PKCS#12 iteration count honoured on key derivation (default 5,000,000).
+    private static final String PKCS12_MAX_IT_COUNT = "org.bouncycastle.pkcs12.max_it_count";
+    private static final BigInteger DEFAULT_MAX_IT_COUNT = BigInteger.valueOf(5000000);
+
     private static Map keySizes = new HashMap();
     private static Set noIvAlgs = new HashSet();
     private static Set desAlgs = new HashSet();
@@ -91,7 +97,7 @@ class PKCS12PBEUtils
     {
         PKCS12ParametersGenerator pGen = new PKCS12ParametersGenerator(digest);
 
-        pGen.init(PKCS12ParametersGenerator.PKCS12PasswordToBytes(password), pbeParams.getIV(), pbeParams.getIterations().intValue());
+        pGen.init(PKCS12ParametersGenerator.PKCS12PasswordToBytes(password), pbeParams.getIV(), validateIterationCount(pbeParams.getIterations()));
 
         final KeyParameter keyParam = (KeyParameter)pGen.generateDerivedMacParameters(digest.getDigestSize() * 8);
 
@@ -131,7 +137,7 @@ class PKCS12PBEUtils
     {
         PKCS12ParametersGenerator pGen = new PKCS12ParametersGenerator(digest);
 
-        pGen.init(PKCS12ParametersGenerator.PKCS12PasswordToBytes(password), pbeParams.getIV(), pbeParams.getIterations().intValue());
+        pGen.init(PKCS12ParametersGenerator.PKCS12PasswordToBytes(password), pbeParams.getIV(), validateIterationCount(pbeParams.getIterations()));
 
         CipherParameters params;
 
@@ -149,5 +155,32 @@ class PKCS12PBEUtils
             }
         }
         return params;
+    }
+
+    // The iteration count is wire-supplied (and, for a MAC, used before the MAC can be checked),
+    // so it is bounded (as the PKCS#12 keystore does) to cap a CPU DoS, rather than truncated.
+    private static int validateIterationCount(BigInteger ic)
+    {
+        if (ic.signum() < 0)
+        {
+            throw new IllegalStateException("negative iteration count found");
+        }
+        if (ic.bitLength() > 31)
+        {
+            throw new IllegalStateException("iteration counts >= 2^31 are not suppported");
+        }
+
+        BigInteger max = Properties.asBigInteger(PKCS12_MAX_IT_COUNT);
+        if (max == null)
+        {
+            max = DEFAULT_MAX_IT_COUNT;
+        }
+
+        if (ic.compareTo(max) > 0)
+        {
+            throw new IllegalStateException("iteration count " + ic + " greater than " + max);
+        }
+
+        return ic.intValue();
     }
 }
