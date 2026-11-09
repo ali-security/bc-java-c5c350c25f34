@@ -79,6 +79,15 @@ public class CMSAuthenticatedData
 
         AuthenticatedData authData = AuthenticatedData.getInstance(contentInfo.getContent());
 
+        // RFC 5652 sec 9.1: digestAlgorithm and authAttrs are set together - the MAC covers
+        // DER(authAttrs) when they are present and the content directly when they are not, so a
+        // message where the two disagree cannot be verified consistently.
+        if ((authData.getDigestAlgorithm() != null) != (authData.getAuthAttrs() != null))
+        {
+            throw new CMSException("Malformed content.",
+                new IllegalArgumentException("digestAlgorithm and authAttrs must be set together"));
+        }
+
         if (authData.getOriginatorInfo() != null)
         {
             this.originatorInfo = new OriginatorInformation(authData.getOriginatorInfo());
